@@ -1,0 +1,4 @@
+reason,cases,pct_of_misses,pct_of_all
+"Phrase seen, but the word was not in the top 3",14962,95.9,71.2
+Earlier words never seen together in training,400,2.6,1.9
+Next word is rare (outside vocabulary),242,1.6,1.2

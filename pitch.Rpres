@@ -1,0 +1,60 @@
+Next Word Predictor
+========================================================
+author: Hein Htet Linn Nyan
+date: `r format(Sys.Date(), "%d %B %Y")`
+autosize: true
+
+Type less. The app suggests your next word as you type.
+
+```{r setup, include=FALSE}
+library(data.table)
+res   <- fread("output/improved_results.csv")
+final <- res[.N]
+base  <- res[1]
+model <- readRDS("shiny_app/final_model.rds")
+pct   <- function(x) paste0(round(100 * x), "%")
+```
+
+The problem
+========================================================
+
+- Typing on a phone is slow.
+- Many words are predictable from the words just before them.
+- A good suggestion saves a tap on almost every word.
+
+**The product:** a web app that shows the three most likely next words as you type, and adds one with a single click.
+
+How the model works
+========================================================
+
+- Trained on `r format(length(model$vocab), big.mark = ",")` words from blogs, news and Twitter.
+- Counts which words follow each 1-, 2- and 3-word phrase.
+- To predict, it looks up the last three words typed.
+- If that phrase was never seen, it drops the oldest word and tries again ("backoff").
+- Improvements: equal text from each source, rare phrases pruned, and the backoff weight tuned on separate data.
+
+How well it works
+========================================================
+
+Tested on text the model never saw:
+
+| Measure | Result |
+|:--|:--|
+| Right word is the first suggestion | `r pct(final$top1)` |
+| Right word is in the top three | `r pct(final$top3)` |
+| Time per prediction | `r final$ms_per_pred` ms |
+| Model file size | `r round(file.size("shiny_app/final_model.rds") / 1024^2, 1)` MB |
+
+For comparison, the basic model got `r pct(base$top3)` in the top three on the same test.
+
+Try the app
+========================================================
+
+**Link:** https://heinhtet.shinyapps.io/shiny_app/
+
+1. Type a phrase, e.g. *"thanks for the"*.
+2. Three suggested words appear as buttons.
+3. Click one to add it to your text, and keep going.
+4. The bar chart shows how confident the model is in each word.
+
+Fast, small and simple: ready to build into a keyboard.

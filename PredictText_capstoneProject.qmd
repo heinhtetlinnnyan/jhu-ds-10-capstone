@@ -1,0 +1,75 @@
+---
+title: "Next Word Predictor"
+subtitle: "Type less. The app suggests your next word as you type."
+author: "Hein Htet Linn Nyan"
+date: today
+format:
+  revealjs:
+    theme: simple
+    slide-number: true
+    embed-resources: true
+execute:
+  echo: false
+---
+
+```{r}
+library(data.table)
+res   <- fread("output/improved_results.csv")
+final <- res[.N]
+base  <- res[1]
+model <- readRDS("shiny_app/final_model.rds")
+pct   <- function(x) paste0(round(100 * x), "%")
+app_url <- "https://heinhtet.shinyapps.io/shiny_app/"
+```
+
+## The problem and the product
+
+- Typing is slow.
+- Many words can be guessed from the words you just typed.
+- A good suggestion saves.
+
+::: {.callout-tip appearance="simple"}
+**Next Word Predictor** shows the three most likely next words as you type. One click adds a word.
+:::
+
+## How the model works
+
+- Learned from `r format(length(model$vocab), big.mark = ",")` distinct words in blogs, news and Twitter (English).
+- Counts which words follow each 1-, 2- and 3-word phrase.
+- Looks up the last three words you typed.
+- If that phrase was never seen, drops the oldest word and tries again ("backoff").
+
+
+## How well it works
+
+Tested on text the model never saw:
+
+:::: {.columns}
+::: {.column width="50%"}
+<h2>`r pct(final$top3)`</h2>
+right word in the top three
+
+<h2>`r pct(final$top1)`</h2>
+right word as first guess
+:::
+::: {.column width="50%"}
+<h2>`r round(final$ms_per_pred)` ms</h2>
+per prediction
+
+<h2>`r round(file.size("shiny_app/final_model.rds") / 1024^2, 1)` MB</h2>
+model file
+:::
+::::
+
+The basic model scored `r pct(base$top3)` in the top three on the same test.
+
+## Try the app
+
+**[`r app_url`](`r app_url`)**
+
+1. Type a phrase, e.g. *"thanks for the"*.
+2. Three suggested words appear as buttons, best guess first.
+3. Click one to add it, and keep typing.
+4. The bars show how confident the model is in each word.
+
+Small, fast and simple: ready to build into a keyboard.

@@ -1,0 +1,355 @@
+---
+title: "Next-Word Prediction: Building, Evaluating and Improving the Model"
+author: "Hein Htet Linn Nyan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(data.table)
+library(stringi)
+library(ggplot2)
+library(knitr)
+```
+
+```{r load-results, include=FALSE}
+# Run next_word_model.R and improve_model.R before knitting
+needed <- c("output/model_results.csv", "output/improved_results.csv",
+            "models/final_model.rds")
+missing <- needed[!file.exists(needed)]
+if (length(missing))
+  stop("Missing: ", paste(missing, collapse = ", "),
+       ". Run next_word_model.R, then improve_model.R, before knitting.")
+
+pct  <- function(x, d = 1) paste0(round(100 * x, d), "%")
+chg  <- function(x) sprintf("%+.1f", 100 * x)       # change in percentage points
+
+## Stage 1
+res <- fread("output/model_results.csv")
+res[, train_pct := paste0(round(100 * train_frac), "%")]
+
+best_top3 <- max(res$top3)
+chosen <- res[top3 >= best_top3 - 0.005][order(app_mb)][1]
+
+gain_by_mc <- res[, .(gain = top3[which.max(train_frac)] - top3[which.min(train_frac)]),
+                  by = min_count]
+
+largest   <- res[train_frac == max(train_frac)]
+unpruned  <- largest[min_count == min(min_count)]
+pruned    <- largest[min_count == max(min_count)]
+size_drop <- round(100 * (1 - pruned$app_mb / unpruned$app_mb))
+acc_drop  <- round(100 * (unpruned$top3 - pruned$top3), 1)
+
+r_top1 <- round(cor(res$perplexity, res$top1), 2)
+r_top3 <- round(cor(res$perplexity, res$top3), 2)
+
+## Stage 2
+imp       <- fread("output/improved_results.csv")
+by_src    <- fread("output/improved_by_source.csv")
+alpha_tab <- fread("output/alpha_tuning.csv")
+reasons   <- fread("output/missed_reasons.csv")
+m_words   <- fread("output/missed_words.csv")
+m_pairs   <- fread("output/missed_pairs.csv")
+calib     <- fread("output/calibration.csv")
+final     <- readRDS("models/final_model.rds")
+
+base_row  <- imp[1]
+bal_row   <- imp[2]
+big_row   <- imp[3]
+final_row <- imp[.N]
+
+# Same settings in both stages: text keys (stage 1) vs integer IDs (stage 2)
+text_row <- res[train_frac == base_row$train_frac & min_count == base_row$min_count]
+has_text_row <- nrow(text_row) == 1
+
+bin_low   <- as.numeric(sub("^[\\(\\[]([0-9.]+),.*$", "\\1", calib$conf_bin))
+sure      <- calib[bin_low >= 0.5]
+sure_share <- sum(sure$cases) / sum(calib$cases)
+sure_hit   <- sum(sure$cases * sure$hit_rate) / sum(sure$cases)
+unsure     <- calib[bin_low < 0.2]
+unsure_hit <- sum(unsure$cases * unsure$hit_rate) / sum(unsure$cases)
+```
+
+## Summary
+
+The app suggests the next word from the last few words typed.
+
+On a test set with equal amounts of blog, news and Twitter text, the basic model put the correct word in its top three suggestions `r pct(base_row$top3)` of the time.
+The improved model reaches `r pct(final_row$top3)`.
+It uses `r final_row$app_mb` MB of memory and returns suggestions in `r final_row$ms_per_pred` milliseconds.
+
+# Part 1: The basic model
+
+## How the model works
+
+The model learns from counts of short word sequences (n-grams) in the training text: single words, and runs of two, three and four words.
+To predict, it looks up the last three words typed and finds which words most often followed them.
+If that three-word phrase never appeared in training, it drops the oldest word and tries again with two, then one.
+Each step down is scored lower, so matches on longer phrases win.
+This method is called "stupid backoff". It is simple and fast, and works well on large text collections.
+
+Words seen only once in training are treated as a single "unknown word" token.
+Only the top five candidates for each phrase are kept, since the app shows three.
+
+## How it was tested
+
+Before training, 5,000 lines were set aside and never used to build the model.
+From these, 20,000 positions were picked at random. At each one, the model was given the preceding words and asked for the next.
+
+Four measures were recorded:
+
+- **Top-1, top-2, top-3 accuracy:** how often the correct word was the first suggestion, in the first two, or in the first three.
+- **Perplexity:** how surprised the model is by the real text, on average. Lower is better.
+- **Speed:** milliseconds per prediction, averaged over 300 single predictions.
+- **Size:** memory used by the tables the app needs.
+
+Nine versions were compared: three training sizes (1%, 3% and 5% of the data) crossed with three pruning levels.
+Pruning drops word sequences seen fewer than 2 or 4 times in training.
+
+## Results
+
+```{r results-table}
+res[, .(`Training data` = train_pct,
+        `Min count`     = min_count,
+        `Size (MB)`     = app_mb,
+        `ms / pred`     = ms_per_pred,
+        `Top-1`         = pct(top1),
+        `Top-2`         = pct(top2),
+        `Top-3`         = pct(top3),
+        Perplexity      = perplexity)] |>
+  kable(caption = "Table 1. All nine basic model versions")
+```
+
+### More data or a bigger model?
+
+```{r plot-accuracy, fig.height=4, fig.width=9}
+res |>
+  melt(id.vars = c("train_pct", "min_count"),
+       measure.vars = c("top1", "top2", "top3"),
+       variable.name = "measure", value.name = "accuracy") |>
+  ggplot(aes(train_pct, accuracy, colour = measure, group = measure)) +
+  geom_line() +
+  geom_point(size = 2) +
+  facet_wrap(~ min_count, labeller = labeller(min_count = function(x) paste("Min count", x))) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_colour_discrete(labels = c("Top-1", "Top-2", "Top-3")) +
+  labs(x = "Share of data used for training", y = "Accuracy", colour = NULL,
+       title = "Figure 1. Accuracy by training size and pruning level") +
+  theme_minimal()
+```
+
+Going from `r min(res$train_pct)` to `r max(res$train_pct)` of the data changed top-3 accuracy by `r chg(min(gain_by_mc$gain))` to `r chg(max(gain_by_mc$gain))` percentage points, depending on pruning.
+
+### Does accuracy cost speed?
+
+```{r plot-speed, fig.height=4, fig.width=7}
+ggplot(res, aes(ms_per_pred, top3, colour = train_pct)) +
+  geom_point(size = 3) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Milliseconds per prediction", y = "Top-3 accuracy", colour = "Training data",
+       title = "Figure 2. Accuracy vs speed") +
+  theme_minimal()
+```
+
+Prediction time ranged from `r min(res$ms_per_pred)` to `r max(res$ms_per_pred)` ms.
+A typist presses a key every 100 to 300 ms, so any time well below that is fast enough.
+
+### Does perplexity agree with accuracy?
+
+```{r plot-perplexity, fig.height=4, fig.width=7}
+ggplot(res, aes(perplexity, top3, colour = train_pct)) +
+  geom_point(size = 3) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Perplexity (lower is better)", y = "Top-3 accuracy", colour = "Training data",
+       title = "Figure 3. Perplexity vs accuracy") +
+  theme_minimal()
+```
+
+The correlation between perplexity and accuracy was `r r_top1` for top-1 and `r r_top3` for top-3.
+A negative value means lower perplexity goes with higher accuracy, as expected.
+The match is not exact, for two reasons.
+Perplexity scores the probability the model gives the right word, while accuracy only asks whether the right word made the top three.
+And each training size has its own vocabulary, which shifts perplexity in ways that do not affect accuracy.
+
+### Can the model be made smaller?
+
+```{r plot-size, fig.height=4, fig.width=7}
+ggplot(res, aes(app_mb, top3, colour = train_pct)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = paste("min", min_count)), vjust = -1, size = 3, show.legend = FALSE) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Model size (MB)", y = "Top-3 accuracy", colour = "Training data",
+       title = "Figure 4. Accuracy vs model size") +
+  theme_minimal()
+```
+
+With `r largest$train_pct[1]` of the data, dropping sequences seen fewer than `r pruned$min_count` times cut the model size by `r size_drop`% and changed top-3 accuracy by `r chg(-acc_drop / 100)` percentage points.
+Most of the size comes from phrases seen once, which rarely help predict anything.
+
+The best trade-off in Part 1 was `r chosen$train_pct` of the data with a minimum count of `r chosen$min_count`: the smallest version within half a percentage point of the best accuracy.
+
+# Part 2: Improving the model
+
+Four changes were tested, each against the same held-out text.
+This time the test set has equal amounts of blog, news and Twitter text (21,000 positions in total), so no single source dominates the score.
+A separate development set was used for tuning, so the test set was never used to make choices.
+
+1. **Store words as numbers.** Part 1 stored every phrase as text. Here each word gets a number, and each phrase becomes a single number, which takes less memory and is faster to look up.
+2. **Balance the sources.** Twitter has far more lines than blogs or news, so a plain random sample is mostly tweets. Here each source contributes the same number of lines.
+3. **Use more data, pruned harder.** The smaller storage leaves room for more training text. The extra size is held back by dropping phrases seen fewer than 3 times.
+4. **Tune the backoff weight.** When the model falls back to a shorter phrase, it multiplies the score by a fixed weight (0.4 in Part 1). The best weight was chosen on the development set.
+
+```{r improved-table}
+imp[, .(Version     = variant,
+        `Size (MB)` = app_mb,
+        `ms / pred` = ms_per_pred,
+        `Top-1`     = pct(top1),
+        `Top-2`     = pct(top2),
+        `Top-3`     = pct(top3),
+        Perplexity  = perplexity)] |>
+  kable(caption = "Table 2. Improved versions, scored on the balanced test set")
+```
+
+### Words as numbers
+
+```{r text-vs-id, results="asis"}
+if (has_text_row) {
+  cat(sprintf(
+    "With the same settings (%s of the data, minimum count %d), storing words as numbers changed the model size from %s MB to %s MB and prediction time from %s ms to %s ms.",
+    pct(base_row$train_frac, 0), base_row$min_count,
+    text_row$app_mb, base_row$app_mb, text_row$ms_per_pred, base_row$ms_per_pred))
+  cat(" Accuracy is unaffected, since the method is the same; only the storage changed.")
+}
+```
+
+### Balanced sources
+
+```{r plot-source, fig.height=4, fig.width=9}
+by_src[, variant := factor(variant, levels = imp$variant)] |>
+  ggplot(aes(source, top3, fill = variant)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = NULL, y = "Top-3 accuracy", fill = NULL,
+       title = "Figure 5. Accuracy by source of the test text") +
+  theme_minimal() +
+  theme(legend.position = "bottom", legend.direction = "vertical")
+```
+
+Balancing the sources changed overall top-3 accuracy by `r chg(bal_row$top3 - base_row$top3)` percentage points.
+Figure 5 shows where the change came from: tweets are written differently from news and blogs, so the mix of training text shifts which kind of writing the model predicts well.
+
+### More data, pruned harder
+
+Training on `r pct(big_row$train_frac, 0)` of the data with a minimum count of `r big_row$min_count` changed top-3 accuracy by `r chg(big_row$top3 - bal_row$top3)` points compared with the balanced `r pct(bal_row$train_frac, 0)` model, and model size from `r bal_row$app_mb` to `r big_row$app_mb` MB.
+
+### Backoff weight
+
+```{r plot-alpha, fig.height=3.5, fig.width=7}
+ggplot(alpha_tab, aes(alpha, top3)) +
+  geom_line(colour = "steelblue") +
+  geom_point(colour = "steelblue", size = 2) +
+  geom_vline(xintercept = final$alpha, linetype = "dashed") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Backoff weight", y = "Top-3 accuracy (development set)",
+       title = "Figure 6. Choosing the backoff weight") +
+  theme_minimal()
+```
+
+The best weight on the development set was `r final$alpha`.
+On the test set, it changed top-3 accuracy by `r chg(final_row$top3 - big_row$top3)` points compared with the default of 0.4.
+
+## What the model gets wrong
+
+```{r reasons}
+reasons[, .(Reason = reason, `Share of misses` = paste0(pct_of_misses, "%"))] |>
+  kable(caption = "Table 3. Why the correct word was not in the top three")
+```
+
+The most common reason was: `r tolower(reasons$reason[1])` (`r reasons$pct_of_misses[1]`% of misses).
+
+The three reasons need different fixes.
+A rare next word cannot be predicted by any counting model; the only remedy is a larger vocabulary, which costs memory.
+Earlier words never seen together shrink as training data grows.
+When the phrase was seen but the word ranked lower, many different words commonly follow that phrase. After "I want to", for example, hundreds of verbs are reasonable. Counting cannot tell them apart; only more context, such as the topic of the whole sentence, can.
+
+```{r missed-words}
+m_words[, .(Word = word, `Times in test` = occurrences, Missed = missed,
+            `Miss rate` = pct(miss_rate, 0))] |>
+  kable(caption = "Table 4. Words most often missed")
+```
+
+```{r missed-pairs}
+m_pairs[, .(`Word pair` = pair, `Times missed` = missed, `Model's usual guess` = usual_guess)] |>
+  kable(caption = "Table 5. Word pairs most often missed")
+```
+
+The most missed words are common ones, because common words appear after many different phrases.
+Table 5 shows the typical pattern: the model predicts the single most common continuation, and the real text used a different, also common, word.
+
+More training data, as in the larger model, only helps with phrases that were never seen.
+For phrases with many plausible next words, the fix is a model that uses more of the sentence, which is beyond simple counting (see "What others have tried" below).
+
+## How sure is the model?
+
+Each suggestion comes with the share of times that word followed the phrase in training.
+This can serve as a confidence score, if it matches how often the model is actually right.
+
+```{r plot-calibration, fig.height=4, fig.width=6}
+ggplot(calib, aes(mean_conf, hit_rate)) +
+  geom_abline(linetype = "dashed", colour = "grey50") +
+  geom_point(aes(size = cases), colour = "steelblue") +
+  geom_line(colour = "steelblue") +
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(x = "Model's confidence in its first guess", y = "How often the first guess was right",
+       size = "Test cases",
+       title = "Figure 7. Confidence vs actual accuracy") +
+  theme_minimal()
+```
+
+Points on the dashed line mean the confidence score is honest.
+When the model was at least 50% confident (`r pct(sure_share, 0)` of cases), its first guess was right `r pct(sure_hit, 0)` of the time.
+When it was under 20% confident, it was right `r pct(unsure_hit, 0)` of the time.
+The app can use this: show suggestions more prominently when confidence is high, and less so when it is low.
+
+## Questions considered
+
+**Other data sets.** Text closer to how people type on phones would help most: film and TV subtitles (OpenSubtitles), Reddit comments, or text-message corpora. Google's published n-gram counts cover far more text than this data set, but are dominated by books. Adding any of these would need a check that the extra size is worth the accuracy.
+
+**Where n-gram models waste resources.** Storing phrases as text repeats each word thousands of times (fixed here with number IDs). Most stored phrases appear only once and almost never help (fixed by pruning). The model also stores every candidate word, when the app only needs the top few (fixed by keeping five per phrase).
+
+**What others have tried.** Better smoothing methods, such as Kneser-Ney, give more realistic probabilities to rare words. Some models interpolate across all phrase lengths instead of backing off. Personal models update from what the user types. Neural models, from recurrent networks to today's transformers, read the whole sentence and do much better on ambiguous phrases, but are far larger and slower than a model that has to run in a small Shiny app.
+
+## Final model
+
+The app will use the last version in Table 2: balanced sources, `r pct(final_row$train_frac, 0)` of the data, minimum count `r final_row$min_count`, and backoff weight `r final$alpha`.
+
+```{r examples}
+source("ngram_engine.R")
+
+examples <- c("thanks for the", "I want to", "at the end of the",
+              "let me know if", "happy mothers", "see you")
+
+show_pred <- function(phrase) {
+  w <- predict_next(final, phrase, alpha = final$alpha)
+  paste0(w, " (", round(100 * attr(w, "p")), "%)", collapse = ", ")
+}
+
+data.table(`Typed text`  = examples,
+           Suggestions   = vapply(examples, show_pred, character(1))) |>
+  kable(caption = "Table 6. Example suggestions, with the model's confidence in each")
+```
+
+## Next steps
+
+- Build the Shiny app around the final model: a text box, with three suggested words that update as the user types.
+- Filter profanity from the suggestions.
+- Show the confidence score in the app, so users can see when a suggestion is a strong match.
+
+## Appendix: code
+
+The model code is in `ngram_engine.R`, `next_word_model.R` and `improve_model.R`. The report code follows.
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+```

@@ -1,0 +1,5 @@
+variant,sampling,train_frac,min_count,alpha,vocab_size,app_mb,build_sec,ms_per_pred,top1,top2,top3,perplexity
+"Baseline: pooled sample, 3%",pooled,0.03,2,0.4,45949,7.7,7.3,8.58,0.144380952380952,0.199714285714286,0.235047619047619,558
+"Balanced sources, 3%",balanced,0.03,2,0.4,51690,9.4,9.1,8.62,0.146047619047619,0.204,0.241095238095238,561
+"Balanced sources, 10%, min count 3",balanced,0.1,3,0.4,93046,15.1,25.1,9.49,0.156952380952381,0.216619047619048,0.255952380952381,512.3
+"Balanced sources, 10%, min count 3, tuned alpha",balanced,0.1,3,0.1,93046,15.1,25.1,9.4,0.157047619047619,0.216666666666667,0.256952380952381,512.3
